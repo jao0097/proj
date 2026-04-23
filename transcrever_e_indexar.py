@@ -1,63 +1,95 @@
-import os
+"""
+transcrever_e_indexar.py
+━━━━━━━━━━━━━━━━━━━━━━━━
+Pipeline completo: baixa a transcrição do YouTube e já indexa no ChromaDB.
+
+Dependências:
+    pip install youtube-transcript-api chromadb groq sentence-transformers
+
+Variáveis de ambiente obrigatórias:
+    GROQ_API_KEY  — chave da API Groq
+
+Opcionais (velocidade / custo):
+    LIMPEZA_TRANSCRICAO=local|ia|nenhuma  (padrão: local — rápido, 0 tokens na limpeza)
+
+Uso:
+    python transcrever_e_indexar.py              # pede só a URL → transcreve, metadados (Groq) e indexa
+    python transcrever_e_indexar.py "URL"      # mesmo fluxo sem menu
+    python transcrever_e_indexar.py --menu     # menu antigo (pergunta, pasta, etc.)
+    python transcrever_e_indexar.py --pergunta "texto"
+    python transcrever_e_indexar.py --processar-pasta
+
+Menos tokens (velocidade):
+    export LIMPEZA_TRANSCRICAO=local          # padrão — limpeza sem Groq
+    export GROQ_METADADOS_MAX_CHARS=2000    # menos texto no prompt de metadados
+    export CHROMA_CHUNK_PALAVRAS=600         # menos chunks = menos embeddings locais (mais rápido)
+"""
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IMPORTS
+# ══════════════════════════════════════════════════════════════════════════════
+
 import json
+import math
+import os
 import re
+import sys
 import time
 import difflib
+import unicodedata
+from datetime import date
+from urllib.parse import urlencode
+from urllib.request import urlopen
+
+from youtube_transcript_api import YouTubeTranscriptApi
 import chromadb
-from groq import Groq
 from chromadb.utils import embedding_functions
+from groq import Groq
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIGURAÇÕES — edite apenas aqui
 # ══════════════════════════════════════════════════════════════════════════════
 
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "sua_chave_groq_aqui")
-PASTA_TRANSCRICOES = "/home/joao/Documentos/transcricoes"
-PASTA_CHROMA       = "/home/joao/Documentos/chroma_db"
+PASTA_TRANSCRICOES = os.path.expanduser("~/Documentos/transcricoes")
+PASTA_CHROMA       = os.path.expanduser("~/Documentos/chroma_db")
 ARQUIVO_LOG_DEBUG  = os.path.join(PASTA_TRANSCRICOES, "debug-indexacao.log")
 
-# Modelos (sobrescreva via variáveis de ambiente, se quiser)
-MODELO_RAPIDO  = os.getenv("GROQ_MODELO_RAPIDO", "groq/compound-mini")
+MODELO_RAPIDO  = os.getenv("GROQ_MODELO_RAPIDO",  "groq/compound-mini")
 MODELO_POTENTE = os.getenv("GROQ_MODELO_POTENTE", "llama-3.3-70b-versatile")
+# Limpeza em lote: não use compound — o sistema Compound usa 70B por baixo e esgota TPM (429) rápido.
 MODELO_LIMPEZA = os.getenv("GROQ_MODELO_LIMPEZA", "llama-3.1-8b-instant")
+# local = rápido, 0 tokens Groq | ia = limpeza com LLM (lenta) | nenhuma = texto bruto
 LIMPEZA_TRANSCRICAO = os.getenv("LIMPEZA_TRANSCRICAO", "local").strip().lower()
+# Só usados no modo ia: blocos maiores = menos chamadas (menos tokens de system repetido).
 MAX_CHARS_LIMPEZA_GROQ = int(os.getenv("GROQ_LIMPEZA_MAX_CHARS", "7500"))
 PAUSA_ENTRE_BLOCOS_LIMPEZA_S = float(os.getenv("GROQ_LIMPEZA_PAUSA_S", "1.25"))
 GROQ_MAX_RETRIES = int(os.getenv("GROQ_MAX_RETRIES", "10"))
+# Indexação: chunks maiores = menos embeddings locais (mais rápido, mesmo custo API).
 CHROMA_CHUNK_PALAVRAS = int(os.getenv("CHROMA_CHUNK_PALAVRAS", "500"))
 CHROMA_CHUNK_OVERLAP = int(os.getenv("CHROMA_CHUNK_OVERLAP", "50"))
+# Metadados (Groq): só um trecho da transcrição — menor = menos tokens de entrada.
+GROQ_METADADOS_MAX_CHARS = int(os.getenv("GROQ_METADADOS_MAX_CHARS", "4000"))
 
-
-def _debug_log(hypothesis_id: str, location: str, message: str, data: dict):
-    payload = {
-        "sessionId": "31946b",
-        "runId": "pre-fix",
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    try:
-        os.makedirs(PASTA_TRANSCRICOES, exist_ok=True)
-        with open(ARQUIVO_LOG_DEBUG, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
-    except OSError:
-        # Logging nunca deve interromper o pipeline principal.
-        pass
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  INICIALIZAÇÃO
+#  VALIDAÇÃO INICIAL
 # ══════════════════════════════════════════════════════════════════════════════
 
-# #region agent log
-_debug_log("H1", "indexaçao.py:init", "Initialization started", {"transcricoesPath": PASTA_TRANSCRICOES, "chromaPath": PASTA_CHROMA, "apiKeyPlaceholder": GROQ_API_KEY == "sua_chave_groq_aqui"})
-# #endregion
 if GROQ_API_KEY == "sua_chave_groq_aqui":
     raise RuntimeError(
-        "GROQ_API_KEY não configurada. Defina a variável de ambiente antes de rodar. "
+        "GROQ_API_KEY não configurada. Defina a variável de ambiente antes de rodar.\n"
         "Exemplo: export GROQ_API_KEY='sua_chave_real'"
     )
+
+os.makedirs(PASTA_TRANSCRICOES, exist_ok=True)
+os.makedirs(PASTA_CHROMA, exist_ok=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INICIALIZAÇÃO DE CLIENTES
+# ══════════════════════════════════════════════════════════════════════════════
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
@@ -70,15 +102,76 @@ chroma_client = chromadb.PersistentClient(path=PASTA_CHROMA)
 collection = chroma_client.get_or_create_collection(
     name="transcricoes_youtube",
     embedding_function=embedding_fn,
-    metadata={"hnsw:space": "cosine"}
+    metadata={"hnsw:space": "cosine"},
 )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  UTILITÁRIO GROQ — função base reutilizada em tudo
+#  UTILITÁRIOS — TRANSCRIÇÃO
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_video_id(video_input: str) -> str:
+    value = video_input.strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", value):
+        return value
+    patterns = [
+        r"(?:v=|\/)([A-Za-z0-9_-]{11})(?:[?&].*)?$",
+        r"youtu\.be\/([A-Za-z0-9_-]{11})(?:[?&].*)?$",
+        r"youtube\.com\/shorts\/([A-Za-z0-9_-]{11})(?:[?&].*)?$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, value)
+        if match:
+            return match.group(1)
+    raise ValueError("Não foi possível extrair o ID do vídeo a partir da URL informada.")
+
+
+def sanitize_filename(name: str) -> str:
+    normalized    = unicodedata.normalize("NFKD", name)
+    no_accents    = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    lowered       = no_accents.lower()
+    underscored   = re.sub(r"\s+", "_", lowered)
+    cleaned       = re.sub(r"[^a-z0-9_]", "", underscored)
+    compacted     = re.sub(r"_+", "_", cleaned).strip("_")
+    return compacted or "transcricao"
+
+
+def get_video_metadata(video_id: str) -> dict:
+    query = urlencode({"url": f"https://www.youtube.com/watch?v={video_id}", "format": "json"})
+    with urlopen(f"https://www.youtube.com/oembed?{query}") as response:
+        data = json.loads(response.read().decode("utf-8"))
+    return {
+        "titulo": data.get("title", video_id),
+        "canal":  data.get("author_name", "Canal desconhecido"),
+    }
+
+
+def estimate_duration_seconds(transcript_items) -> int:
+    if not transcript_items:
+        return 0
+    last = transcript_items[-1]
+    if isinstance(last, dict):
+        start    = float(last.get("start", 0))
+        duration = float(last.get("duration", 0))
+    else:
+        start    = float(getattr(last, "start", 0))
+        duration = float(getattr(last, "duration", 0))
+    return int(math.ceil(start + duration))
+
+
+def format_duration_hhmmss(total_seconds: int) -> str:
+    h = total_seconds // 3600
+    m = (total_seconds % 3600) // 60
+    s = total_seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UTILITÁRIOS — GROQ
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _pausa_retry_groq(erro: BaseException, tentativa: int) -> float:
+    """Extrai 'try again in Xs' da mensagem da API ou usa backoff."""
     texto = str(erro)
     m = re.search(r"try again in ([\d.]+)\s*s", texto, re.I)
     if m:
@@ -108,12 +201,8 @@ def chamar_groq(
     prompt_sistema: str,
     prompt_usuario: str,
     modelo: str = MODELO_RAPIDO,
-    json_mode: bool = False
+    json_mode: bool = False,
 ) -> str:
-    """
-    Chama a API do Groq e retorna o texto da resposta.
-    json_mode=True garante que a resposta será um JSON válido.
-    """
     kwargs = {
         "model": modelo,
         "temperature": 0.2,
@@ -122,20 +211,13 @@ def chamar_groq(
             {"role": "user",   "content": prompt_usuario},
         ],
     }
-
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
     ultimo: BaseException | None = None
     for tentativa in range(GROQ_MAX_RETRIES):
-        # #region agent log
-        _debug_log("H2", "indexaçao.py:chamar_groq_before", "Calling Groq API", {"model": modelo, "jsonMode": json_mode, "attempt": tentativa})
-        # #endregion
         try:
             resposta = groq_client.chat.completions.create(**kwargs)
-            # #region agent log
-            _debug_log("H2", "indexaçao.py:chamar_groq_after", "Groq API call succeeded", {"hasChoices": bool(getattr(resposta, "choices", None))})
-            # #endregion
             return resposta.choices[0].message.content
         except Exception as e:
             ultimo = e
@@ -150,7 +232,7 @@ def chamar_groq(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ETAPA 1 — LIMPEZA DA TRANSCRIÇÃO
+#  ETAPA 1 — LIMPEZA
 # ══════════════════════════════════════════════════════════════════════════════
 
 _RE_TAG_TRANSCRICAO = re.compile(r"\[[^\]]+\]")
@@ -193,10 +275,6 @@ def _dividir_texto_para_limpeza(texto: str, max_chars: int) -> list[str]:
 
 
 def limpar_transcricao(texto_bruto: str) -> str:
-    """
-    Modo `local` (padrão): limpeza rápida por regex, sem tokens Groq.
-    Modo `ia`: vários blocos via Groq. `nenhuma`: texto bruto.
-    """
     modo = LIMPEZA_TRANSCRICAO
     if modo in ("nenhuma", "none", "off", "0", "raw"):
         print("  ⏭️  Limpeza desativada — usando texto bruto.")
@@ -206,7 +284,6 @@ def limpar_transcricao(texto_bruto: str) -> str:
         return limpar_transcricao_local(texto_bruto)
 
     print("  🧹 Limpando transcrição com Groq (modo ia)...")
-
     SISTEMA = """Você é um editor de texto especializado em transcrições de vídeos.
 Sua única função é limpar e formatar o texto recebido.
 
@@ -244,20 +321,13 @@ Regras obrigatórias:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ETAPA 2 — GERAÇÃO DE METADADOS COM GROQ
+#  ETAPA 2 — METADADOS COM IA
 # ══════════════════════════════════════════════════════════════════════════════
 
 def gerar_metadados_ia(titulo: str, transcricao_limpa: str) -> dict:
-    """
-    Usa o Groq para extrair metadados semânticos da transcrição:
-    resumo, palavras-chave, tópicos, nível técnico etc.
-    Retorna um dicionário pronto para ser mesclado no .json existente.
-    """
     print("  📋 Gerando metadados com Groq...")
-
     SISTEMA = """Você é um assistente que analisa transcrições de vídeos do YouTube.
 Retorne APENAS um JSON válido, sem texto adicional, sem markdown."""
-
     USUARIO = f"""Analise a transcrição abaixo e retorne um JSON com exatamente essas chaves:
 
 {{
@@ -271,21 +341,17 @@ Retorne APENAS um JSON válido, sem texto adicional, sem markdown."""
 
 Título do vídeo: {titulo}
 
-Transcrição (primeiros 4000 caracteres):
-{transcricao_limpa[:4000]}"""
-
+Transcrição (primeiros {GROQ_METADADOS_MAX_CHARS} caracteres):
+{transcricao_limpa[:GROQ_METADADOS_MAX_CHARS]}"""
     resposta = chamar_groq(SISTEMA, USUARIO, json_mode=True)
     return json.loads(resposta)
 
 
 def atualizar_json(caminho_json: str, novos_dados: dict):
-    """Mescla os metadados gerados pelo Groq no .json existente."""
     with open(caminho_json, "r", encoding="utf-8") as f:
         dados = json.load(f)
-
     dados.update(novos_dados)
-    dados["indexado_chroma"] = False  # ainda não foi pro ChromaDB
-
+    dados["indexado_chroma"] = False
     with open(caminho_json, "w", encoding="utf-8") as f:
         json.dump(dados, f, ensure_ascii=False, indent=2)
 
@@ -299,34 +365,22 @@ def fazer_chunks(
     tamanho: int | None = None,
     overlap: int | None = None,
 ) -> list[str]:
-    """
-    Divide o texto em chunks de palavras com sobreposição.
-    Tamanhos padrão vêm de CHROMA_CHUNK_PALAVRAS / CHROMA_CHUNK_OVERLAP (env).
-    """
     t = CHROMA_CHUNK_PALAVRAS if tamanho is None else tamanho
     o = CHROMA_CHUNK_OVERLAP if overlap is None else overlap
     palavras = texto.split()
     chunks   = []
     passo    = max(1, t - o)
-
     for i in range(0, len(palavras), passo):
         chunk = " ".join(palavras[i : i + t])
         if chunk.strip():
             chunks.append(chunk)
-
     return chunks
 
 
 def indexar_video(caminho_txt: str, caminho_json: str):
-    """
-    Lê o par .txt + .json, faz o chunking da transcrição
-    e indexa tudo no ChromaDB com os metadados do .json.
-    Marca 'indexado_chroma: true' no .json ao finalizar.
-    """
     with open(caminho_json, "r", encoding="utf-8") as f:
         metadados = json.load(f)
 
-    # evita indexar duas vezes
     if metadados.get("indexado_chroma") is True:
         print(f"  ⏭️  Já indexado: {metadados['titulo']}")
         return
@@ -335,7 +389,6 @@ def indexar_video(caminho_txt: str, caminho_json: str):
         texto = f.read()
 
     chunks = fazer_chunks(texto)
-
     if not chunks:
         print(f"  ⚠️  Arquivo vazio: {caminho_txt}")
         return
@@ -357,7 +410,6 @@ def indexar_video(caminho_txt: str, caminho_json: str):
 
     collection.add(ids=ids, documents=documentos, metadatas=metas)
 
-    # marca como indexado
     metadados["indexado_chroma"] = True
     with open(caminho_json, "w", encoding="utf-8") as f:
         json.dump(metadados, f, ensure_ascii=False, indent=2)
@@ -370,24 +422,15 @@ def indexar_video(caminho_txt: str, caminho_json: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def buscar_titulos_no_chroma() -> list[str]:
-    """Retorna todos os títulos únicos que estão no ChromaDB."""
     resultado = collection.get(include=["metadatas"])
-    titulos   = list({m["titulo"] for m in resultado["metadatas"]})
-    return titulos
+    return list({m["titulo"] for m in resultado["metadatas"]})
 
 
 def classificar_pergunta(pergunta: str, titulos: list[str]) -> dict:
-    """
-    Usa o Groq para entender o tipo de pergunta e decidir
-    quantos chunks buscar e se deve filtrar por vídeo específico.
-    """
     print("  🔀 Classificando pergunta...")
-
     SISTEMA = """Você é um classificador de perguntas para um sistema RAG.
 Retorne APENAS um JSON válido."""
-
     lista_titulos = "\n".join(f"- {t}" for t in titulos)
-
     USUARIO = f"""Classifique a pergunta abaixo com base nos vídeos disponíveis.
 
 Vídeos disponíveis:
@@ -408,7 +451,6 @@ Regras para n_chunks:
 - geral:           5
 - comparativa:     6
 - fora_de_escopo:  0"""
-
     resposta = chamar_groq(SISTEMA, USUARIO, json_mode=True)
     return json.loads(resposta)
 
@@ -418,34 +460,25 @@ Regras para n_chunks:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def buscar_chunks(pergunta: str, classificacao: dict) -> list[dict]:
-    """
-    Busca os chunks mais relevantes no ChromaDB
-    usando a classificação do Groq para decidir filtros e quantidade.
-    """
-    n        = classificacao.get("n_chunks", 3)
-    tipo     = classificacao.get("tipo")
-    alvo     = classificacao.get("video_alvo")
-    where    = {"titulo": alvo} if tipo == "especifica" and alvo else None
+    n     = classificacao.get("n_chunks", 3)
+    tipo  = classificacao.get("tipo")
+    alvo  = classificacao.get("video_alvo")
+    where = {"titulo": alvo} if tipo == "especifica" and alvo else None
 
-    kwargs = {
-        "query_texts": [pergunta],
-        "n_results":   n,
-    }
+    kwargs = {"query_texts": [pergunta], "n_results": n}
     if where:
         kwargs["where"] = where
 
     resultado = collection.query(**kwargs)
-
-    chunks = []
-    for doc, meta in zip(resultado["documents"][0], resultado["metadatas"][0]):
-        chunks.append({
+    return [
+        {
             "texto":  doc,
             "titulo": meta.get("titulo", "Desconhecido"),
             "url":    meta.get("url", ""),
             "chunk":  meta.get("chunk_index", 0),
-        })
-
-    return chunks
+        }
+        for doc, meta in zip(resultado["documents"][0], resultado["metadatas"][0])
+    ]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -453,19 +486,12 @@ def buscar_chunks(pergunta: str, classificacao: dict) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def responder(pergunta: str, chunks: list[dict]) -> str:
-    """
-    Monta o contexto com os chunks encontrados e envia ao Groq
-    para gerar a resposta final, citando as fontes.
-    """
     print("  💬 Gerando resposta com Groq...")
-
-    blocos = []
-    for i, c in enumerate(chunks):
-        bloco = f"[Fonte {i+1}]\nVídeo: {c['titulo']}\nURL: {c['url']}\nTrecho:\n{c['texto']}"
-        blocos.append(bloco)
-
+    blocos = [
+        f"[Fonte {i+1}]\nVídeo: {c['titulo']}\nURL: {c['url']}\nTrecho:\n{c['texto']}"
+        for i, c in enumerate(chunks)
+    ]
     contexto = "\n\n" + "─" * 60 + "\n\n".join(blocos) + "\n\n" + "─" * 60
-
     SISTEMA = """Você é um assistente especializado em responder perguntas
 com base em transcrições de vídeos do YouTube.
 
@@ -477,35 +503,135 @@ Regras obrigatórias:
 - Nunca invente informações
 - Seja direto e objetivo
 - Ao final, liste as fontes usadas com título e URL"""
-
-    USUARIO = f"""Contexto dos vídeos:
-{contexto}
-
-Pergunta: {pergunta}"""
-
+    USUARIO = f"Contexto dos vídeos:\n{contexto}\n\nPergunta: {pergunta}"
     return chamar_groq(SISTEMA, USUARIO, modelo=MODELO_POTENTE)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PIPELINES PRINCIPAIS
+#  PIPELINES
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _parece_url_ou_id_youtube(s: str) -> bool:
+    s = (s or "").strip()
+    if not s:
+        return False
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", s):
+        return True
+    low = s.lower()
+    return "youtube.com" in low or "youtu.be" in low
+
+
+def pipeline_transcrever_e_indexar(video_url_input: str | None = None):
+    """
+    Pipeline completo:
+      1. Pede a URL do YouTube
+      2. Baixa a transcrição
+      3. Salva .txt e .json
+      4. Limpa a transcrição com Groq
+      5. Gera metadados com Groq
+      6. Indexa no ChromaDB
+    """
+    # ── 1. URL ────────────────────────────────────────────────────────────────
+    if video_url_input is None:
+        video_url_input = input("Cole a URL (ou ID) do vídeo do YouTube: ").strip()
+    video_id        = extract_video_id(video_url_input)
+    video_url       = f"https://youtube.com/watch?v={video_id}"
+    data_coleta     = date.today().isoformat()
+
+    print(f"\n📥 Baixando transcrição: {video_url}")
+
+    # ── 2. Transcrição ────────────────────────────────────────────────────────
+    api        = YouTubeTranscriptApi()
+    transcript = api.fetch(video_id, languages=["pt", "pt-BR"])
+
+    texto_bruto       = " ".join(
+        (t["text"] if isinstance(t, dict) else t.text) for t in transcript
+    )
+    duracao_segundos  = estimate_duration_seconds(transcript)
+    duracao_formatada = format_duration_hhmmss(duracao_segundos)
+    metadata          = get_video_metadata(video_id)
+    titulo_video      = metadata["titulo"]
+    canal_video       = metadata["canal"]
+
+    print(f"   Título : {titulo_video}")
+    print(f"   Canal  : {canal_video}")
+    print(f"   Duração: {duracao_formatada}")
+
+    # ── 3. Salvar .txt e .json ────────────────────────────────────────────────
+    base_name    = sanitize_filename(titulo_video)
+    txt_destino  = os.path.join(PASTA_TRANSCRICOES, f"{base_name}.txt")
+    json_destino = os.path.join(PASTA_TRANSCRICOES, f"{base_name}.json")
+
+    txt_conteudo = (
+        f"TÍTULO: {titulo_video}\n"
+        f"URL: {video_url}\n"
+        f"DATA DE INDEXAÇÃO: {data_coleta}\n"
+        f"DURAÇÃO ESTIMADA: {duracao_formatada}\n"
+        f"[TRANSCRIÇÃO]\n"
+        f"{texto_bruto}"
+    )
+    with open(txt_destino, "w", encoding="utf-8") as f:
+        f.write(txt_conteudo)
+
+    json_conteudo = {
+        "titulo":          titulo_video,
+        "url":             video_url,
+        "canal":           canal_video,
+        "data_coleta":     data_coleta,
+        "duracao_segundos": duracao_segundos,
+        "idioma":          "pt",
+        "indexado_chroma": False,
+    }
+    with open(json_destino, "w", encoding="utf-8") as f:
+        json.dump(json_conteudo, f, ensure_ascii=False, indent=2)
+
+    print(f"\n💾 Transcrição bruta salva em: {txt_destino}")
+
+    # ── 4. Limpeza ────────────────────────────────────────────────────────────
+    print(f"\n🎬 Processando: {titulo_video}")
+    texto_limpo = limpar_transcricao(texto_bruto)
+    with open(txt_destino, "w", encoding="utf-8") as f:
+        f.write(texto_limpo)
+
+    # ── 5. Metadados ──────────────────────────────────────────────────────────
+    metadados_ia = gerar_metadados_ia(titulo_video, texto_limpo)
+    atualizar_json(json_destino, metadados_ia)
+
+    # ── 6. Indexação ──────────────────────────────────────────────────────────
+    indexar_video(txt_destino, json_destino)
+
+    print(f"\n🏁 Pronto! Total de chunks no banco: {collection.count()}")
+
+
+def pipeline_perguntar(pergunta: str) -> str:
+    """Busca nos vídeos indexados e responde usando Groq."""
+    print(f"\n🔍 Pergunta: {pergunta}\n{'─'*50}")
+    titulos = buscar_titulos_no_chroma()
+    if not titulos:
+        return "Nenhum vídeo indexado ainda. Transcreva um vídeo primeiro."
+
+    classificacao = classificar_pergunta(pergunta, titulos)
+    print(f"  Tipo: {classificacao['tipo']} | Raciocínio: {classificacao['raciocinio']}")
+
+    if classificacao["tipo"] == "fora_de_escopo":
+        return "Essa pergunta está fora do escopo dos vídeos disponíveis."
+
+    chunks = buscar_chunks(pergunta, classificacao)
+    if not chunks:
+        return "Não encontrei chunks relevantes para essa pergunta."
+
+    resposta = responder(pergunta, chunks)
+    print("─" * 50)
+    return resposta
+
 
 def pipeline_processar_pasta():
     """
-    Varre /home/joao/Documentos/transcricoes, e para cada par .txt + .json:
-    1. Limpa a transcrição com Groq
-    2. Gera metadados com Groq
-    3. Indexa no ChromaDB
-    Pula arquivos que já foram indexados.
+    Processa todos os pares .txt + .json ainda não indexados
+    que já existam na pasta de transcrições (compatibilidade com o fluxo antigo).
     """
-    # #region agent log
-    _debug_log("H3", "indexaçao.py:pipeline_start", "Starting folder processing", {"path": PASTA_TRANSCRICOES, "pathExists": os.path.exists(PASTA_TRANSCRICOES)})
-    # #endregion
     arquivos = os.listdir(PASTA_TRANSCRICOES)
     txts     = [a for a in arquivos if a.endswith(".txt")]
-    # #region agent log
-    _debug_log("H3", "indexaçao.py:txt_scan", "Scanned transcript files", {"totalFiles": len(arquivos), "txtCount": len(txts)})
-    # #endregion
 
     if not txts:
         print("Nenhum .txt encontrado na pasta.")
@@ -524,9 +650,6 @@ def pipeline_processar_pasta():
 
         with open(caminho_json, "r", encoding="utf-8") as f:
             metadados = json.load(f)
-        # #region agent log
-        _debug_log("H4", "indexaçao.py:json_loaded", "Loaded metadata JSON", {"jsonPath": caminho_json, "hasTitulo": "titulo" in metadados, "indexado": metadados.get("indexado_chroma")})
-        # #endregion
 
         if metadados.get("indexado_chroma") is True:
             print(f"⏭️  Já indexado: {metadados['titulo']}")
@@ -534,238 +657,92 @@ def pipeline_processar_pasta():
 
         print(f"\n🎬 Processando: {metadados['titulo']}")
 
-        # lê o txt atual
         with open(caminho_txt, "r", encoding="utf-8") as f:
             texto_bruto = f.read()
-        # #region agent log
-        _debug_log("H5", "indexaçao.py:txt_loaded", "Loaded transcript text", {"txtPath": caminho_txt, "textLen": len(texto_bruto)})
-        # #endregion
 
-        # etapa 1 — limpa
         texto_limpo = limpar_transcricao(texto_bruto)
-
-        # sobrescreve o .txt com a versão limpa
         with open(caminho_txt, "w", encoding="utf-8") as f:
             f.write(texto_limpo)
 
-        # etapa 2 — metadados
         metadados_ia = gerar_metadados_ia(metadados["titulo"], texto_limpo)
         atualizar_json(caminho_json, metadados_ia)
-
-        # etapa 3 — indexa
         indexar_video(caminho_txt, caminho_json)
 
     print(f"\n🏁 Pronto! Total de chunks no banco: {collection.count()}")
 
 
-def _normalizar_texto_busca(texto: str) -> str:
-    return " ".join(texto.lower().strip().split())
-
-
-def _tokenizar_texto_busca(texto: str) -> set[str]:
-    tokens = []
-    for parte in _normalizar_texto_busca(texto).split():
-        limpo = "".join(ch for ch in parte if ch.isalnum())
-        if len(limpo) >= 3:
-            tokens.append(limpo)
-    return set(tokens)
-
-
-def _pontuar_relevancia_video(consulta: str, candidato: dict) -> float:
-    """
-    Calcula score de relevância combinando:
-    - similaridade de string (difflib)
-    - sobreposição de tokens
-    """
-    alvo = _normalizar_texto_busca(
-        f"{candidato['titulo']} {candidato['nome_txt']} {candidato.get('amostra_texto', '')}"
-    )
-    consulta_norm = _normalizar_texto_busca(consulta)
-
-    if not consulta_norm or not alvo:
-        return 0.0
-
-    ratio = difflib.SequenceMatcher(None, consulta_norm, alvo).ratio()
-
-    tokens_consulta = _tokenizar_texto_busca(consulta_norm)
-    tokens_alvo = _tokenizar_texto_busca(alvo)
-    inter = len(tokens_consulta & tokens_alvo)
-    token_score = inter / max(1, len(tokens_consulta))
-
-    # Peso maior para tokens em comum, depois similaridade geral.
-    return (0.7 * token_score) + (0.3 * ratio)
-
-
-def _carregar_candidatos_videos_novos() -> list[dict]:
-    """Retorna vídeos ainda não indexados com caminhos e metadados básicos."""
-    candidatos = []
-    if not os.path.exists(PASTA_TRANSCRICOES):
-        return candidatos
-
-    arquivos = os.listdir(PASTA_TRANSCRICOES)
-    txts = [a for a in arquivos if a.endswith(".txt")]
-
-    for nome_txt in txts:
-        nome_base = nome_txt.replace(".txt", "")
-        caminho_txt = os.path.join(PASTA_TRANSCRICOES, nome_txt)
-        caminho_json = os.path.join(PASTA_TRANSCRICOES, f"{nome_base}.json")
-
-        if not os.path.exists(caminho_json):
-            continue
-
-        try:
-            with open(caminho_json, "r", encoding="utf-8") as f:
-                metadados = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            continue
-
-        if metadados.get("indexado_chroma") is True:
-            continue
-
-        titulo = metadados.get("titulo", nome_base)
-        amostra_texto = ""
-        try:
-            with open(caminho_txt, "r", encoding="utf-8") as f:
-                amostra_texto = f.read(2500)
-        except OSError:
-            amostra_texto = ""
-        candidatos.append(
-            {
-                "titulo": titulo,
-                "nome_txt": nome_txt,
-                "caminho_txt": caminho_txt,
-                "caminho_json": caminho_json,
-                "amostra_texto": amostra_texto,
-            }
-        )
-
-    return candidatos
-
-
-def _selecionar_video_por_input(candidatos: list[dict], nome_digitado: str) -> dict | None:
-    """Seleciona por relevância textual (título + arquivo + conteúdo)."""
-    termo = _normalizar_texto_busca(nome_digitado)
-    if not termo:
-        return None
-
-    ranqueados = []
-    for candidato in candidatos:
-        score = _pontuar_relevancia_video(termo, candidato)
-        ranqueados.append((score, candidato))
-
-    ranqueados.sort(key=lambda x: x[0], reverse=True)
-    melhor_score, melhor_candidato = ranqueados[0]
-
-    # Match forte: já retorna direto.
-    if melhor_score >= 0.35:
-        return melhor_candidato
-
-    # Match fraco: mostra opções para escolha manual.
-    print("\nNão tive confiança alta no match automático.")
-    print("Escolha um dos vídeos mais próximos:")
-    top = ranqueados[:5]
-    for i, (score, c) in enumerate(top, start=1):
-        print(f"  {i}. [{score:.2f}] {c['titulo']} ({c['nome_txt']})")
-
-    escolha = input("Número correto (ou Enter para cancelar): ").strip()
-    if escolha.isdigit():
-        idx = int(escolha) - 1
-        if 0 <= idx < len(top):
-            return top[idx][1]
-    return None
-
-
-def processar_video_especifico(caminho_txt: str, caminho_json: str):
-    with open(caminho_json, "r", encoding="utf-8") as f:
-        metadados = json.load(f)
-
-    if metadados.get("indexado_chroma") is True:
-        print(f"⏭️  Já indexado: {metadados['titulo']}")
-        return
-
-    print(f"\n🎬 Processando: {metadados.get('titulo', os.path.basename(caminho_txt))}")
-
-    with open(caminho_txt, "r", encoding="utf-8") as f:
-        texto_bruto = f.read()
-
-    texto_limpo = limpar_transcricao(texto_bruto)
-    with open(caminho_txt, "w", encoding="utf-8") as f:
-        f.write(texto_limpo)
-
-    metadados_ia = gerar_metadados_ia(metadados["titulo"], texto_limpo)
-    atualizar_json(caminho_json, metadados_ia)
-    indexar_video(caminho_txt, caminho_json)
-
-
-def pipeline_processar_video_novo_por_nome():
-    """
-    Pergunta o nome do vídeo novo, confirma correspondência com arquivos
-    não indexados na pasta de transcrições e processa apenas esse vídeo.
-    """
-    candidatos = _carregar_candidatos_videos_novos()
-    if not candidatos:
-        print("Nenhum vídeo novo (.txt + .json não indexado) encontrado.")
-        return
-
-    nome_digitado = input(
-        "Qual o nome/tema do vídeo novo? (pode descrever assunto, palavras faladas etc.): "
-    ).strip()
-    video = _selecionar_video_por_input(candidatos, nome_digitado)
-
-    if not video:
-        print("Não consegui identificar o vídeo novo com esse nome.")
-        return
-
-    print(f"\nVídeo encontrado: {video['titulo']} ({video['nome_txt']})")
-    confirmar = input("É esse mesmo o vídeo novo? (s/n): ").strip().lower()
-    if confirmar not in ("s", "sim", "y", "yes"):
-        print("Processo cancelado pelo usuário.")
-        return
-
-    processar_video_especifico(video["caminho_txt"], video["caminho_json"])
-    print(f"\n🏁 Pronto! Total de chunks no banco: {collection.count()}")
-
-
-def pipeline_perguntar(pergunta: str) -> str:
-    """
-    Recebe uma pergunta do usuário e retorna a resposta com base
-    nos vídeos indexados. Fluxo completo:
-    1. Classifica a pergunta com Groq
-    2. Busca chunks relevantes no ChromaDB
-    3. Responde com Groq usando o contexto encontrado
-    """
-    print(f"\n🔍 Pergunta: {pergunta}\n{'─'*50}")
-
-    titulos = buscar_titulos_no_chroma()
-
-    if not titulos:
-        return "Nenhum vídeo indexado ainda. Rode pipeline_processar_pasta() primeiro."
-
-    # etapa 4 — classifica
-    classificacao = classificar_pergunta(pergunta, titulos)
-    print(f"  Tipo: {classificacao['tipo']} | Raciocínio: {classificacao['raciocinio']}")
-
-    if classificacao["tipo"] == "fora_de_escopo":
-        return "Essa pergunta está fora do escopo dos vídeos disponíveis."
-
-    # etapa 5 — busca
-    chunks = buscar_chunks(pergunta, classificacao)
-
-    if not chunks:
-        return "Não encontrei chunks relevantes para essa pergunta."
-
-    # etapa 6 — responde
-    resposta = responder(pergunta, chunks)
-
-    print("─" * 50)
-    return resposta
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  EXECUÇÃO
+#  MENU INTERATIVO
 # ══════════════════════════════════════════════════════════════════════════════
+
+def menu():
+    opcoes = {
+        "1": ("Transcrever e indexar novo vídeo (URL)",  pipeline_transcrever_e_indexar),
+        "2": ("Processar .txt/.json já salvos na pasta", pipeline_processar_pasta),
+        "3": ("Fazer uma pergunta sobre os vídeos",      None),
+        "0": ("Sair",                                    None),
+    }
+
+    while True:
+        print("\n" + "═" * 50)
+        print("  📼  Transcrever & Indexar YouTube")
+        print("═" * 50)
+        for k, (desc, _) in opcoes.items():
+            print(f"  [{k}] {desc}")
+        print("═" * 50)
+
+        escolha = input("Opção: ").strip()
+
+        if escolha == "0":
+            print("Até logo!")
+            break
+        elif escolha == "1":
+            pipeline_transcrever_e_indexar()
+        elif _parece_url_ou_id_youtube(escolha):
+            print("(URL/ID detectado na opção — iniciando transcrição e indexação.)")
+            try:
+                pipeline_transcrever_e_indexar(video_url_input=escolha)
+            except ValueError as exc:
+                print(f"Não deu para usar essa entrada como vídeo: {exc}")
+        elif escolha == "2":
+            pipeline_processar_pasta()
+        elif escolha == "3":
+            pergunta = input("Sua pergunta: ").strip()
+            if pergunta:
+                print("\n" + pipeline_perguntar(pergunta))
+        else:
+            print("Opção inválida.")
+
+
+def _main_cli(argv: list[str]) -> None:
+    """Fluxo padrão: só URL → pipeline completo. Use --menu para o menu interativo."""
+    args = argv[1:]
+    if not args:
+        print("Cole a URL (ou ID) do YouTube — transcrição, metadados e indexação serão feitos em sequência.\n")
+        pipeline_transcrever_e_indexar()
+        return
+    if args[0] in ("--menu", "-m", "menu"):
+        menu()
+        return
+    if args[0] == "--pergunta" and len(args) >= 2:
+        pergunta = " ".join(args[1:]).strip()
+        if not pergunta:
+            print("Use: --pergunta \"sua pergunta\"")
+            return
+        print("\n" + pipeline_perguntar(pergunta))
+        return
+    if args[0] in ("--processar-pasta", "-p"):
+        pipeline_processar_pasta()
+        return
+    if args[0].startswith("-"):
+        print("Opções: URL | --menu | --pergunta \"...\" | --processar-pasta")
+        return
+    url = " ".join(args).strip()
+    pipeline_transcrever_e_indexar(video_url_input=url)
+
 
 if __name__ == "__main__":
-
-    # ── Modo interativo: processa apenas um vídeo novo por nome ──────────────
-    pipeline_processar_video_novo_por_nome()
+    if os.getenv("PIPELINE_MENU", "").strip() in ("1", "true", "yes", "sim"):
+        menu()
+    else:
+        _main_cli(sys.argv)
